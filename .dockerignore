@@ -5,3 +5,7 @@ tests
 .env
 **/__pycache__
 garmin_tokens.json
+docs
+tools
+.github
+.coverage*

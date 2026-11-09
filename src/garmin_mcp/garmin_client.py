@@ -13,10 +13,11 @@ import base64
 import binascii
 import json
 import logging
+import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
 import anyio
 from garminconnect import (
@@ -35,9 +36,30 @@ class GarminUnavailable(RuntimeError):
     """Raised with a message that is safe and useful to show to the model/user."""
 
 
+MAX_SEED_LENGTH = 16 * 1024
+
+
+def write_private_file(path: Path, text: str) -> None:
+    """Create/replace ``path`` with mode 0600 from the first byte (no umask window),
+    refusing to follow symlinks, via an atomic rename."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def decode_token_seed(raw: str) -> str:
     """Accept the token blob as raw JSON or base64(JSON); return JSON text."""
     raw = raw.strip()
+    if len(raw) > MAX_SEED_LENGTH:
+        raise ValueError("GARMIN_TOKENS is too large")
     if raw.startswith("{"):
         text = raw
     else:
@@ -45,9 +67,12 @@ def decode_token_seed(raw: str) -> str:
             text = base64.b64decode(raw, validate=True).decode("utf-8")
         except (binascii.Error, UnicodeDecodeError) as e:
             raise ValueError("GARMIN_TOKENS is neither JSON nor base64-encoded JSON") from e
-    data = json.loads(text)
-    if not isinstance(data, dict) or not data.get("di_refresh_token"):
-        raise ValueError("GARMIN_TOKENS does not contain a di_refresh_token")
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        raise ValueError("GARMIN_TOKENS is not valid JSON") from e
+    if not isinstance(data, dict) or not isinstance(data.get("di_refresh_token"), str):
+        raise ValueError("GARMIN_TOKENS does not contain a di_refresh_token")  # noqa: TRY004
     return text
 
 
@@ -58,12 +83,10 @@ def seed_tokens(token_dir: Path, seed: str | None) -> None:
     file whenever it refreshes.
     """
     token_file = token_dir / "garmin_tokens.json"
-    if token_file.exists() or not seed:
+    if token_file.exists() or token_file.is_symlink() or not seed:
         return
     text = decode_token_seed(seed)
-    token_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    token_file.write_text(text, encoding="utf-8")
-    token_file.chmod(0o600)
+    write_private_file(token_file, text)
     logger.info("Seeded Garmin tokens into %s", token_file)
 
 
@@ -121,14 +144,3 @@ class GarminService:
 
     async def call(self, fn: Callable[[Garmin], T]) -> T:
         return await anyio.to_thread.run_sync(self.call_sync, fn)
-
-    async def profile(self) -> dict[str, Any]:
-        def _p(g: Garmin) -> dict[str, Any]:
-            return {
-                "full_name": g.get_full_name(),
-                "unit_system": g.get_unit_system(),
-                "timezone": g.get_user_timezone(),
-                "today": g.today().isoformat(),
-            }
-
-        return await self.call(_p)

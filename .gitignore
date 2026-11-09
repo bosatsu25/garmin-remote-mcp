@@ -7,3 +7,6 @@ dist/
 data/
 .env
 garmin_tokens.json
+.coverage
+.coverage.*
+htmlcov/

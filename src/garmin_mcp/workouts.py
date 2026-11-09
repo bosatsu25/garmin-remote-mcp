@@ -47,11 +47,11 @@ _TARGET = {
     "pace": (6, "pace.zone"),
 }
 
-_PACE_RE = re.compile(r"^\s*(\d{1,2}):([0-5]\d)\s*$")
+_PACE_RE = re.compile(r"^\s*([0-9]{1,2}):([0-5][0-9])\s*$", re.ASCII)
 
 
 def pace_to_mps(pace: str, unit: Literal["km", "mi"]) -> float:
-    m = _PACE_RE.match(pace)
+    m = _PACE_RE.fullmatch(pace)
     if not m:
         raise ValueError(f"pace must look like '4:30', got {pace!r}")
     secs = int(m.group(1)) * 60 + int(m.group(2))
@@ -122,11 +122,13 @@ class Target(BaseModel):
             return {"targetType": tt("cadence"), "targetValueOne": self.low,
                     "targetValueTwo": self.high}
         if k == "speed":
-            assert self.low is not None and self.high is not None
+            if self.low is None or self.high is None:  # pragma: no cover - validator guarantees
+                raise ValueError("speed requires low and high")
             return {"targetType": tt("speed"), "targetValueOne": self.low / 3.6,
                     "targetValueTwo": self.high / 3.6}
         # pace: Garmin stores m/s, slower pace (= lower speed) first.
-        assert self.pace_slow and self.pace_fast
+        if not self.pace_slow or not self.pace_fast:  # pragma: no cover - validator guarantees
+            raise ValueError("pace requires pace_fast and pace_slow")
         return {
             "targetType": tt("pace"),
             "targetValueOne": round(pace_to_mps(self.pace_slow, self.pace_unit), 6),
@@ -220,7 +222,8 @@ def build_workout(
                 "smartRepeat": False,
                 "workoutSteps": children,
             }
-        assert step.end is not None
+        if step.end is None:  # pragma: no cover - validator guarantees
+            raise ValueError("step requires end")
         out: dict[str, Any] = {
             "type": "ExecutableStepDTO",
             "stepOrder": order,

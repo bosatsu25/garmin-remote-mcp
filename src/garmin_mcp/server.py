@@ -10,29 +10,36 @@ from typing import Annotated, Any, Literal, TypeVar
 from urllib.parse import urlparse
 
 from garminconnect import Garmin, GarminConnectConnectionError
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.transport_security import RequestBodyLimitMiddleware, TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
 from .compact import summarize_activity, to_text
 from .config import Settings
 from .garmin_client import GarminService, GarminUnavailable, seed_tokens
-from .oauth import SCOPE, OwnerOAuthProvider
-from .workouts import SPORTS, Step, build_workout
+from .oauth import ALL_SCOPES, SCOPE_READ, SCOPE_WRITE, OwnerOAuthProvider
+from .security import redact
+from .workouts import Step, build_workout
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", re.ASCII)
 MAX_RANGE_DAYS = 93
+MAX_BODY_BYTES = 256 * 1024
+# Strict allowlist for garmin_api_get paths: no traversal, no host tricks, no encoding games.
+API_PATH_RE = re.compile(r"^/(?:[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*/?)+$")
+MAX_API_PATH = 256
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
@@ -46,6 +53,7 @@ StartArg = Annotated[str, Field(description="Start date YYYY-MM-DD (inclusive)."
 EndArg = Annotated[
     str | None, Field(description="End date YYYY-MM-DD (inclusive). Defaults to start date.")
 ]
+IdArg = Annotated[int, Field(gt=0, lt=2**63)]
 RawArg = Annotated[
     bool,
     Field(description="Return Garmin's full response including long time series. "
@@ -63,12 +71,12 @@ before calling them.
 
 
 def _check_date(value: str, name: str) -> str:
-    if not DATE_RE.match(value):
-        raise ToolError(f"{name} must be YYYY-MM-DD, got {value!r}")
+    if not isinstance(value, str) or not DATE_RE.fullmatch(value):
+        raise ToolError(f"{name} must be YYYY-MM-DD")
     try:
         date.fromisoformat(value)
     except ValueError as e:
-        raise ToolError(f"{name} is not a valid date: {value}") from e
+        raise ToolError(f"{name} is not a valid calendar date") from e
     return value
 
 
@@ -83,8 +91,33 @@ def _range(start: str, end: str | None) -> tuple[str, str]:
     return s, e
 
 
-def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
-    provider = OwnerOAuthProvider(settings)
+def check_api_path(path: str) -> str:
+    if (
+        not isinstance(path, str)
+        or len(path) > MAX_API_PATH
+        or not API_PATH_RE.fullmatch(path)
+        or "//" in path
+        or "/../" in path + "/"
+        or "/./" in path + "/"
+    ):
+        raise ToolError("path must be an absolute Garmin API path like /usersummary-service/...")
+    return path
+
+
+def require_write_scope() -> None:
+    """Write tools need the garmin:write scope granted on the consent page."""
+    token = get_access_token()
+    if token is None or SCOPE_WRITE not in token.scopes:
+        raise ToolError(
+            "This connection was authorized read-only. Reconnect the connector and tick "
+            "the write permission on the consent page to allow this."
+        )
+
+
+def create_server(
+    settings: Settings, garmin: GarminService, provider: OwnerOAuthProvider | None = None
+) -> MCPServer:
+    provider = provider or OwnerOAuthProvider(settings)
     mcp = MCPServer(
         name="garmin",
         title="Garmin Connect",
@@ -95,9 +128,9 @@ def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
             issuer_url=settings.public_url,
             resource_server_url=settings.resource_url,
             validate_token_resource=True,
-            required_scopes=[SCOPE],
+            required_scopes=[SCOPE_READ],
             client_registration_options=ClientRegistrationOptions(
-                enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]
+                enabled=True, valid_scopes=list(ALL_SCOPES), default_scopes=[SCOPE_READ]
             ),
             revocation_options=RevocationOptions(enabled=True),
         ),
@@ -107,9 +140,9 @@ def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
         try:
             return await garmin.call(fn)
         except GarminUnavailable as e:
-            raise ToolError(str(e)) from e
+            raise ToolError(redact(str(e))) from e
         except (ValueError, GarminConnectConnectionError) as e:
-            raise ToolError(f"Garmin request failed: {e}") from e
+            raise ToolError(redact(f"Garmin request failed: {e}"[:500])) from e
 
     async def day(cdate: str | None) -> str:
         if cdate:
@@ -269,11 +302,13 @@ def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
         else:
             items = await run(lambda g: g.get_activities(0, limit, activity_type))
         items = items if isinstance(items, list) else []
-        return to_text([summarize_activity(a) for a in items])
+        # Summaries are already small; generic list truncation would silently drop items the
+        # caller asked for (limit up to 100). The output character cap still applies.
+        return to_text([summarize_activity(a) for a in items], raw=True)
 
     @mcp.tool(annotations=READ)
     async def get_activity(
-        activity_id: Annotated[int, Field(description="Activity ID from list_activities.")],
+        activity_id: Annotated[IdArg, Field(description="Activity ID from list_activities.")],
         include_splits: Annotated[bool, Field(description="Include per-lap splits.")] = True,
         raw: RawArg = False,
     ) -> str:
@@ -310,7 +345,7 @@ def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
 
     @mcp.tool(annotations=READ)
     async def get_workout(
-        workout_id: Annotated[int, Field(description="Workout ID from list_workouts.")],
+        workout_id: Annotated[IdArg, Field(description="Workout ID from list_workouts.")],
     ) -> str:
         """Full step structure of a saved workout."""
         return to_text(await run(lambda g: g.get_workout_by_id(workout_id)))
@@ -323,17 +358,20 @@ def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
         return to_text(await run(lambda g: g.get_scheduled_workouts_by_period(s, e)))
 
     # ---------------------------------------------------------- escape hatch
-    @mcp.tool(annotations=READ)
-    async def garmin_api_get(
-        path: Annotated[str, Field(description="Garmin Connect API path starting with '/', "
-                                   "e.g. /metrics-service/metrics/trainingreadiness/2026-01-01")],
-        params: Annotated[dict[str, str] | None, Field(description="Query parameters.")] = None,
-        raw: RawArg = False,
-    ) -> str:
-        """Read-only GET against any Garmin Connect API path, for data no other tool covers."""
-        if not path.startswith("/") or ".." in path or "://" in path:
-            raise ToolError("path must be an absolute API path like /usersummary-service/...")
-        return to_text(await run(lambda g: g.connectapi(path, params=params or None)), raw=raw)
+    if settings.enable_raw_api:
+        @mcp.tool(annotations=READ)
+        async def garmin_api_get(
+            path: Annotated[str, Field(max_length=MAX_API_PATH, description=(
+                "Garmin Connect API path starting with '/', "
+                "e.g. /metrics-service/metrics/trainingreadiness/2026-01-01"))],
+            params: Annotated[dict[str, Annotated[str, Field(max_length=200)]] | None,
+                              Field(max_length=20, description="Query parameters.")] = None,
+            raw: RawArg = False,
+        ) -> str:
+            """Read-only GET against any Garmin Connect API path, for data no other tool
+            covers."""
+            p = check_api_path(path)
+            return to_text(await run(lambda g: g.connectapi(p, params=params or None)), raw=raw)
 
     # ------------------------------------------------------------- write ops
     if settings.allow_write:
@@ -356,14 +394,11 @@ def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
         ) -> str:
             """Create a structured workout in the owner's Garmin library (synced to the watch),
             optionally scheduling it. Ask the user to confirm the plan before calling."""
-            if sport not in SPORTS:
-                raise ToolError(f"unsupported sport {sport}")
+            require_write_scope()
             if schedule_date:
                 _check_date(schedule_date, "schedule_date")
-            try:
-                payload = build_workout(name, sport, steps, description)
-            except ValueError as e:
-                raise ToolError(str(e)) from e
+            # sport/steps are already validated by the schema (Literal, Step validators).
+            payload = build_workout(name, sport, steps, description)
             created = await run(lambda g: g.upload_workout(payload))
             wid = created.get("workoutId") if isinstance(created, dict) else None
             result: dict[str, Any] = {"workoutId": wid, "workoutName": name}
@@ -378,51 +413,112 @@ def create_server(settings: Settings, garmin: GarminService) -> MCPServer:
 
         @mcp.tool(annotations=WRITE)
         async def schedule_workout(
-            workout_id: Annotated[int, Field(description="Workout ID from list_workouts.")],
+            workout_id: Annotated[IdArg, Field(description="Workout ID from list_workouts.")],
             date: Annotated[str, Field(description="YYYY-MM-DD")],
         ) -> str:
             """Put an existing saved workout on the Garmin calendar for a date."""
+            require_write_scope()
             d = _check_date(date, "date")
             return to_text(await run(lambda g: g.schedule_workout(workout_id, d)))
 
         @mcp.tool(annotations=DESTRUCTIVE)
         async def unschedule_workout(
-            scheduled_workout_id: Annotated[int, Field(
+            scheduled_workout_id: Annotated[int, Field(gt=0, lt=2**63,
                 description="Scheduled item id from get_calendar (not the workout id).")],
         ) -> str:
             """Remove a workout from the calendar. The workout stays in the library."""
+            require_write_scope()
             await run(lambda g: g.unschedule_workout(scheduled_workout_id))
             return to_text({"unscheduled": scheduled_workout_id})
 
         @mcp.tool(annotations=DESTRUCTIVE)
         async def delete_workout(
-            workout_id: Annotated[int, Field(description="Workout ID from list_workouts.")],
+            workout_id: Annotated[IdArg, Field(description="Workout ID from list_workouts.")],
         ) -> str:
             """Permanently delete a saved workout from the library. Confirm with the user first."""
+            require_write_scope()
             await run(lambda g: g.delete_workout(workout_id))
             return to_text({"deleted": workout_id})
 
     return mcp
 
 
-def create_app(settings: Settings | None = None) -> Starlette:
+SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"strict-transport-security", b"max-age=63072000; includeSubDomains"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"x-frame-options", b"DENY"),
+    (b"cross-origin-opener-policy", b"same-origin"),
+    (b"cross-origin-resource-policy", b"same-origin"),
+    (b"permissions-policy", b"camera=(), microphone=(), geolocation=(), interest-cohort=()"),
+)
+DEFAULT_CSP = (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'")
+
+
+class SecurityHeadersMiddleware:
+    """Add defensive headers to every HTTP response (pages set their own CSP)."""
+
+    def __init__(self, app: ASGIApp, *, hsts: bool = True) -> None:
+        self.app = app
+        self.hsts = hsts
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if k.lower() != b"server"]
+                present = {k.lower() for k, _ in headers}
+                for k, v in SECURITY_HEADERS:
+                    if k == b"strict-transport-security" and not self.hsts:
+                        continue
+                    if k not in present:
+                        headers.append((k, v))
+                if DEFAULT_CSP[0] not in present:
+                    headers.append(DEFAULT_CSP)
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    garmin: GarminService | None = None,
+    provider: OwnerOAuthProvider | None = None,
+    seed: bool = True,
+) -> ASGIApp:
     settings = settings or Settings.from_env()
-    settings.data_dir.mkdir(parents=True, exist_ok=True)
-    seed_tokens(settings.garmin_token_dir, settings.garmin_tokens_seed)
-    garmin = GarminService(settings.garmin_token_dir)
-    mcp = create_server(settings, garmin)
-    public_host = urlparse(settings.public_url).netloc
-    return mcp.streamable_http_app(
+    settings.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if seed:
+        seed_tokens(settings.garmin_token_dir, settings.garmin_tokens_seed)
+    garmin = garmin or GarminService(settings.garmin_token_dir)
+    mcp = create_server(settings, garmin, provider)
+    public = urlparse(settings.public_url)
+    allowed_hosts = [public.netloc]
+    if public.hostname in ("localhost", "127.0.0.1"):
+        allowed_hosts += ["localhost:*", "127.0.0.1:*"]
+    starlette_app: Starlette = mcp.streamable_http_app(
         streamable_http_path=settings.mcp_path,
         stateless_http=True,
         json_response=True,
         host=settings.host,
+        max_request_body_size=MAX_BODY_BYTES,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
-            allowed_hosts=[public_host, "localhost:*", "127.0.0.1:*"],
+            allowed_hosts=allowed_hosts,
             allowed_origins=[settings.public_url, "https://claude.ai", "https://claude.com"],
         ),
     )
+    # Body limit applies to every route (DCR, token, consent form), not just /mcp.
+    app: ASGIApp = RequestBodyLimitMiddleware(starlette_app, MAX_BODY_BYTES)
+    app = SecurityHeadersMiddleware(app, hsts=public.scheme == "https")
+    app.state = starlette_app.state  # type: ignore[attr-defined]
+    app.router = starlette_app.router  # type: ignore[attr-defined]  # lifespan access
+    return app
 
 
 def main() -> None:
@@ -431,8 +527,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
     app = create_app(settings)
-    uvicorn.run(app, host=settings.host, port=settings.port, proxy_headers=True,
-                forwarded_allow_ips="*")
+    # proxy_headers off: client IPs come from Fly-Client-IP only when explicitly trusted.
+    uvicorn.run(app, host=settings.host, port=settings.port, proxy_headers=False,
+                server_header=False, log_level="info")
 
 
 if __name__ == "__main__":

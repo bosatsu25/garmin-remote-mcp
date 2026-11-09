@@ -57,7 +57,8 @@ ACTIVITY_SUMMARY_KEYS = (
     "movingDuration", "elapsedDuration", "elevationGain", "elevationLoss", "averageSpeed",
     "maxSpeed", "averageHR", "maxHR", "calories", "aerobicTrainingEffect",
     "anaerobicTrainingEffect", "trainingEffectLabel", "activityTrainingLoad", "vO2MaxValue",
-    "averageRunningCadenceInStepsPerMinute", "avgPower", "normPower", "averageBikingCadenceInRevPerMinute",
+    "averageRunningCadenceInStepsPerMinute", "avgPower", "normPower",
+    "averageBikingCadenceInRevPerMinute",
     "avgStrideLength", "avgGroundContactTime", "avgVerticalOscillation", "locationName",
     "lapCount", "description",
 )

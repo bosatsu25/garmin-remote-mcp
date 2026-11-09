@@ -13,14 +13,21 @@ Garmin Connect のデータを claude.ai（Web / スマホアプリ）から使�
 
 ```
 claude.ai ──OAuth 2.1 (DCR + PKCE)──▶ このサーバー (/authorize, /token, /register)
-    │                                     │  同意画面で OWNER_PASSWORD を入力
+    │                                     │  同意画面でオーナーパスワードを入力
     └──── Bearer token ──▶ /mcp ──────────┴─▶ Garmin Connect (DI トークン, /data に永続化)
 ```
 
 - **Garmin のパスワードはサーバーに置きません。** 手元の PC で一度だけログインしてトークンを発行し、Fly の secret 経由で渡します。以後のリフレッシュはサーバーが行い、Volume に保存します。サーバーから SSO ログインを繰り返すと Garmin に 429 でブロックされるので、それを避ける設計です。
-- MCP 側のアクセストークンは SHA-256 ハッシュだけをディスクに保存します。
-- OAuth のリダイレクト先は `claude.ai` / `claude.com` / `localhost` に限っています。第三者がクライアントを登録して、認可コードを自分のサーバーに送らせることはできません。
+- **書き込みは接続ごとの明示的な許可が必要です。** 同意画面で「書き込みも許可する」にチェックしない限り、その接続のトークンは `garmin:read` だけになり、書き込みツールはサーバー側で必ず拒否されます。Garmin のデータに悪意ある指示が紛れ込んでいても（プロンプトインジェクション）、読み取り専用の接続からはワークアウトを消せません。
+- **オーナーパスワードは scrypt ハッシュで渡せます**（`OWNER_PASSWORD_HASH`）。サーバーは平文を持ちません。
+- **盗まれたリフレッシュトークンは使い捨てになります。** リフレッシュのたびにトークンをローテーションし、使用済みのトークンが再提示されたらその接続のトークンをすべて失効させます。接続の寿命は最長90日です。
+- MCP 側のトークンは SHA-256 ハッシュだけを、権限 0600 のファイルに保存します。
+- OAuth のリダイレクト先は `claude.ai` / `claude.com` / `localhost` に限っています。userinfo（`claude.ai@evil.com`）、フラグメント、制御文字を含む URL は拒否します。
 - パスワード入力は IP ごとに 15 分で 5 回、全体で 1 時間に 30 回までです。
+- エラーメッセージからトークンらしい文字列を除去してから返します。応答にはセキュリティヘッダー（HSTS、CSP、X-Frame-Options など）を付け、ボディは 256KiB までに制限しています。
+- 依存パッケージはハッシュ付きロックファイルで固定し、CI で脆弱性スキャンとミューテーションテストを実行します。
+
+テスト設計とリスク分析は [docs/test-plan.md](docs/test-plan.md) にまとめています（JSTQB FL V4.0 準拠）。
 
 ## ツール
 
@@ -31,10 +38,10 @@ claude.ai ──OAuth 2.1 (DCR + PKCE)──▶ このサーバー (/authorize, 
 | トレーニング | `get_training_readiness`, `get_training_status`, `get_vo2max`, `get_race_predictions`, `get_endurance_score` |
 | アクティビティ | `list_activities`, `get_activity` |
 | ワークアウト（読み取り） | `list_workouts`, `get_workout`, `get_calendar` |
-| 汎用 | `garmin_api_get`（任意の Connect API パスへの読み取り専用 GET） |
+| 汎用（デフォルト無効） | `garmin_api_get`（任意の Connect API パスへの読み取り専用 GET。`GARMIN_ENABLE_RAW_API=true` で有効） |
 | **書き込み** | `create_workout`, `schedule_workout`, `unschedule_workout`, `delete_workout` |
 
-- 書き込み系は `GARMIN_ALLOW_WRITE=false` にすると公開されません。
+- 書き込み系ツールは、同意画面で書き込みを許可した接続でしか動きません。`GARMIN_ALLOW_WRITE=false` にすると、ツール自体が公開されず、同意画面にもチェックボックスが出ません。
 - `create_workout` はランニング、サイクリング、ウォーキング、ハイキング、カーディオ、その他に対応しています。水泳と筋トレは Garmin 側で専用フィールドが必要なので未対応です。
 - 時系列データ（心拍の全サンプルなど）はデフォルトで省略し、コンテキストを節約します。必要なときは `raw=true` を指定してください。
 
@@ -77,8 +84,10 @@ fly volumes create garmin_data --size 1 --region nrt
 openssl rand -base64 24
 ```
 
+手元でハッシュ化して、ハッシュだけをサーバーに渡します（入力した値は画面に表示されません）。
+
 ```bash
-fly secrets set OWNER_PASSWORD='ここに保存した値' --stage
+garmin-mcp-hash-password | fly secrets import --stage
 ```
 
 ```bash
@@ -99,7 +108,9 @@ rm garmin-tokens.env
 
 1. claude.ai の **設定 → コネクタ → カスタムコネクタを追加** を開きます。
 2. URL に `https://<your-app>.fly.dev/mcp` を入力します。
-3. 「接続」を押すと同意画面が開くので、`OWNER_PASSWORD` を入力します。
+3. 「接続」を押すと同意画面が開くので、オーナーパスワードを入力します。ワークアウトの作成・削除もさせたい場合だけ「書き込みも許可する」にチェックします。
+
+読み取り専用で接続した後に書き込みが必要になったら、コネクタを切断して接続し直し、チェックを入れてください。
 
 スマホアプリでは、Web で追加したコネクタがそのまま使えます。
 
@@ -130,11 +141,19 @@ fly apps restart
 ## ローカル開発
 
 ```bash
-pip install -e ".[dev]"
+pip install --require-hashes -r requirements-dev.lock && pip install --no-deps -e .
 ```
 
+単体・統合・システム・受け入れの全テストを、ブランチカバレッジのゲート付きで実行します。
+
 ```bash
-pytest
+pytest --cov
+```
+
+意図的にセキュリティバグを埋め込み、テストが検出できるか確認します（数分かかります）。
+
+```bash
+python tools/mutation_check.py
 ```
 
 ```bash
@@ -146,9 +165,24 @@ PUBLIC_URL=http://localhost:8000 OWNER_PASSWORD=dev-password-123456 DATA_DIR=./d
 | 変数 | 必須 | 説明 |
 |---|---|---|
 | `PUBLIC_URL` | ✓ | 外部から見える URL。`https://` 必須（localhost のみ http 可） |
-| `OWNER_PASSWORD` | ✓ | 同意画面のパスワード（16文字以上） |
+| `OWNER_PASSWORD_HASH` | ✓※ | `garmin-mcp-hash-password` の出力（推奨） |
+| `OWNER_PASSWORD` | ✓※ | 平文のパスワード（16〜1024文字、制御文字不可）。※どちらか片方だけ指定 |
 | `GARMIN_TOKENS` | 初回 | `garmin-mcp-login` の出力。JSON または base64 |
 | `DATA_DIR` | | 永続化ディレクトリ（デフォルトは `/data`） |
-| `GARMIN_ALLOW_WRITE` | | `false` で書き込み系ツールを無効化（デフォルトは `true`） |
+| `GARMIN_ALLOW_WRITE` | | `false` で書き込み系ツールを無効化（デフォルトは `true`。有効でも接続ごとの許可が必要） |
+| `GARMIN_ENABLE_RAW_API` | | `true` で `garmin_api_get` を有効化（デフォルトは `false`） |
+| `TRUST_FLY_CLIENT_IP` | | レート制限に `Fly-Client-IP` ヘッダーを使うか。Fly 上（`FLY_APP_NAME` がある）ではデフォルト `true`、それ以外では `false`。Fly のプロキシ以外ではこのヘッダーは偽装できます |
 | `ALLOWED_REDIRECT_HOSTS` | | OAuth リダイレクト先として許可するホスト（カンマ区切り） |
 | `PORT` | | 待ち受けポート（デフォルトは `8000`） |
+
+## 依存パッケージの更新
+
+ロックファイルはハッシュ付きです。`pyproject.toml` を変えたら再生成してください（CI が不一致を検出します）。
+
+```bash
+uv pip compile pyproject.toml --generate-hashes --python-version 3.13 --python-platform x86_64-manylinux_2_28 -o requirements.lock
+```
+
+```bash
+uv pip compile pyproject.toml --extra dev --generate-hashes --python-version 3.13 --python-platform x86_64-manylinux_2_28 -o requirements-dev.lock
+```

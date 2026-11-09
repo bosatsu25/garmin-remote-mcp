@@ -16,6 +16,8 @@ from pathlib import Path
 
 from garminconnect import Garmin, GarminConnectTooManyRequestsError
 
+from .garmin_client import write_private_file
+
 
 def _ask(prompt: str) -> str:
     # Prompts go to stderr so stdout stays clean for `| fly secrets import`.
@@ -44,8 +46,7 @@ def main() -> None:
         token_json = g.client.dumps()
 
     if args.out:
-        args.out.write_text(token_json, encoding="utf-8")
-        args.out.chmod(0o600)
+        write_private_file(args.out, token_json)
 
     blob = base64.b64encode(token_json.encode()).decode()
     print(f"Logged in as: {g.get_full_name()}", file=sys.stderr)

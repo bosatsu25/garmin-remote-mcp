@@ -1,0 +1,35 @@
+# Fly.io config. Change `app` to a globally unique name before `fly launch`.
+app = "garmin-mcp-CHANGE-ME"
+primary_region = "nrt"
+
+[build]
+
+[env]
+  DATA_DIR = "/data"
+  PORT = "8000"
+  # PUBLIC_URL must match the app's public URL exactly.
+  PUBLIC_URL = "https://garmin-mcp-CHANGE-ME.fly.dev"
+  # Set to "false" to expose read-only tools only.
+  GARMIN_ALLOW_WRITE = "true"
+
+[mounts]
+  source = "garmin_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

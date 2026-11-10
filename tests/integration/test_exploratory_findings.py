@@ -131,3 +131,24 @@ async def test_unsupported_grant_types_never_issue_tokens(http, grant):
         "assertion": "x", "scope": "garmin:read garmin:write"})
     assert t.status_code >= 400
     assert "access_token" not in t.text
+
+
+# Codex review on PR #3 --------------------------------------------------------------
+@pytest.mark.risk("R01")
+async def test_correct_login_does_not_reopen_the_limit_for_queued_guesses(settings, make_app):
+    """End to end: the owner's correct consent racing a queue of wrong guesses from the
+    same IP must not reset the guesses that are still in flight."""
+    from ..conftest import OAuthDriver, asgi_client
+
+    app = make_app(settings)
+    async with asgi_client(app) as c:
+        d = OAuthDriver(c)
+        cid = await d.client_id()
+        a1, _ = await d.start(cid)
+        a2, _ = await d.start(cid)
+        rid_owner, rid_attacker = d.request_id(a1), d.request_id(a2)
+        await asyncio.gather(d.consent(rid_owner), *[d.consent(rid_attacker, f"bad-{i}")
+                                                     for i in range(4)])
+        # 4 wrong guesses were counted; at most 1 more may be evaluated now.
+        rs = await asyncio.gather(*[d.consent(rid_attacker, f"more-{i}") for i in range(5)])
+        assert sum(r.status_code == 401 for r in rs) <= 1

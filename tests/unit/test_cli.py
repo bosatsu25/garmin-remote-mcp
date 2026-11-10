@@ -28,7 +28,7 @@ def run_hash(monkeypatch, answers):
 def test_hash_password_outputs_import_line(monkeypatch, capsys, fast_hash):
     run_hash(monkeypatch, ["a" * 20, "a" * 20])
     out = capsys.readouterr().out.strip()
-    assert out.startswith("OWNER_PASSWORD_HASH=scrypt$")
+    assert out.startswith("OWNER_PASSWORD_HASH=scrypt-nfkc$")
     assert out.count("\n") == 0
     assert OwnerSecret.from_hash(out.split("=", 1)[1]).verify("a" * 20)
     assert "a" * 20 not in out

@@ -38,10 +38,11 @@ M = [
   'if self.settings.trust_fly_client_ip:', 'if True:'),
  ("attempt counted only after the slow check (race)", "oauth.py",
   '''        reservation = self.limiter.record_failure(ip)
-        if not await self.verify_owner(password):''',
+        if not await self.verify_owner(password):
+            self.limiter.commit(reservation)''',
   '''        reservation = None
         if not await self.verify_owner(password):
-            self.limiter.record_failure(ip)'''),
+            self.limiter.commit(self.limiter.record_failure(ip))'''),
  ("trailing-slash redirect re-enabled", "server.py",
   'starlette_app.router.redirect_slashes = False', 'starlette_app.router.redirect_slashes = True'),
  ("code_challenge length unchecked", "oauth.py",
@@ -50,8 +51,20 @@ M = [
  ("state length unchecked", "oauth.py",
   'if params.state is not None and len(params.state) > MAX_STATE_LENGTH:', 'if False:'),
  ("password normalization removed from verify", "security.py",
-  'actual = _scrypt(normalize_password(candidate), self.salt, self.n, self.r, self.p)',
-  'actual = _scrypt(candidate, self.salt, self.n, self.r, self.p)'),
+  'material = normalize_password(candidate) if self.normalize else candidate',
+  'material = candidate'),
+ ("legacy hashes normalized too (locks out old deployments)", "security.py",
+  'material = normalize_password(candidate) if self.normalize else candidate',
+  'material = normalize_password(candidate)'),
+ ("success wipes in-flight reservations", "security.py",
+  '''        pending = [t for k, t in self._inflight.values() if k == key]
+        if pending:
+            self._hits[key] = pending
+        else:
+            self._hits.pop(key, None)''',
+  '        self._hits.pop(key, None)'),
+ ("redeemed-code records not persisted", "oauth.py",
+  '"used_codes": self._used_codes,', ''),
 ]
 killed, survived = [], []
 for name, f, old, new in M:

@@ -119,3 +119,48 @@ def test_normalization_does_not_merge_distinct_passwords():
     s = OwnerSecret.from_plaintext("passphrase-abc-123-xyz", n=N)
     assert not s.verify("passphrase-ABC-123-xyz")       # case still matters
     assert not s.verify("passphrase-abc-123-xyz ")
+
+
+# ---- versioned hash format (Codex review on PR #3) -------------------------------
+def test_new_hashes_are_marked_as_normalized():
+    assert hash_owner_password(PW, n=N).startswith("scrypt-nfkc$")
+    assert OwnerSecret.from_hash(hash_owner_password(PW, n=N)).normalize is True
+
+
+def _legacy_hash(pw: str) -> str:
+    """A hash as produced before NFKC existed: raw bytes, "scrypt$" prefix."""
+    import hashlib
+    import secrets
+
+    salt = secrets.token_bytes(16)
+    d = hashlib.scrypt(pw.encode(), salt=salt, n=N, r=8, p=1, dklen=32,
+                       maxmem=256 * 1024 * 1024)
+    return f"scrypt${N}$8$1${b64(salt)}${b64(d)}"
+
+
+@pytest.mark.parametrize("pw", [
+    "か\u3099き\u3099く\u3099-decomposed-passphrase",        # NFD, NFKC differs
+    "passphrase-ＡＢＣ-１２３-fullwidth",                       # full-width, NFKC differs
+    "plain-ascii-passphrase-123",
+])
+def test_legacy_hash_still_verifies_the_exact_old_passphrase(pw):
+    """Was: after the NFKC change an existing OWNER_PASSWORD_HASH locked the owner out
+    whenever the passphrase was not already in NFKC form."""
+    s = OwnerSecret.from_hash(_legacy_hash(pw))
+    assert s.normalize is False
+    assert s.verify(pw)
+
+
+def test_legacy_hash_keeps_its_original_semantics():
+    import unicodedata
+
+    pw = "か\u3099き\u3099く\u3099-decomposed-passphrase"
+    s = OwnerSecret.from_hash(_legacy_hash(pw))
+    assert not s.verify(unicodedata.normalize("NFKC", pw))    # no normalization applied
+    assert not s.verify(pw + "\x00")                          # control chars still refused
+
+
+@pytest.mark.parametrize("prefix", ["scrypt-nfc", "Scrypt", "scrypt-nfkc2", "scrypt_nfkc"])
+def test_unknown_hash_versions_rejected(prefix):
+    with pytest.raises(SecretFormatError):
+        OwnerSecret.from_hash(make(prefix=prefix))

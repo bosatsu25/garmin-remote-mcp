@@ -128,6 +128,7 @@ class OwnerOAuthProvider:
         self._access = dict(data.get("access", {}))
         self._refresh = dict(data.get("refresh", {}))
         self._retired = dict(data.get("retired", {}))
+        self._used_codes = dict(data.get("used_codes", {}))
         self._purge_expired()
 
     def _save(self) -> None:
@@ -139,6 +140,9 @@ class OwnerOAuthProvider:
                 "access": self._access,
                 "refresh": self._refresh,
                 "retired": self._retired,
+                # Keyed by code hash; lets replay revocation survive a restart within
+                # the code's lifetime (ASVS V10.4.2).
+                "used_codes": self._used_codes,
             }
         )
         tmp = self._state_file.with_name(f".{self._state_file.name}.{secrets.token_hex(6)}.tmp")
@@ -157,7 +161,9 @@ class OwnerOAuthProvider:
     def _purge_expired(self) -> None:
         now = self.clock()
 
-        def live(rec: dict[str, Any]) -> bool:
+        def live(rec: Any) -> bool:
+            if not isinstance(rec, dict):
+                return False
             exp = rec.get("expires_at")
             return isinstance(exp, (int, float)) and exp > now
 
@@ -165,7 +171,7 @@ class OwnerOAuthProvider:
         self._refresh = {k: v for k, v in self._refresh.items() if live(v)}
         self._retired = {k: v for k, v in self._retired.items() if live(v)}
         self._codes = {k: v for k, v in self._codes.items() if v.expires_at > now}
-        self._used_codes = {k: v for k, v in self._used_codes.items() if v["expires_at"] > now}
+        self._used_codes = {k: v for k, v in self._used_codes.items() if live(v)}
         self._admin_sessions = {k: v for k, v in self._admin_sessions.items() if v > now}
         self._pending = {k: v for k, v in self._pending.items() if v.expires_at > now}
 
@@ -295,6 +301,7 @@ class OwnerOAuthProvider:
         # and this line), so concurrent submissions cannot exceed the limit.
         reservation = self.limiter.record_failure(ip)
         if not await self.verify_owner(password):
+            self.limiter.commit(reservation)
             audit.warning("login_failed ip=%s client_id=%s", ip, pending.client_id)
             return self._login_form(request_id, pending, error="パスワードが違います。",
                                     status=401)
@@ -380,6 +387,7 @@ class OwnerOAuthProvider:
                          extra_headers={"Retry-After": "900"})
         reservation = self.limiter.record_failure(ip)
         if not await self.verify_owner(str(form.get("password", ""))):
+            self.limiter.commit(reservation)
             audit.warning("admin_login_failed ip=%s", ip)
             return _connections_login(error="パスワードが違います。", status=401)
         self.limiter.record_success(ip, reservation)

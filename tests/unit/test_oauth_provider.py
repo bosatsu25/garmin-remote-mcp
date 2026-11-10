@@ -444,3 +444,44 @@ async def test_records_with_garbage_expiry_are_dropped(settings, clock):
     p = OwnerOAuthProvider(settings, clock=clock)
     assert p._access == {}
     assert p._refresh == {}
+
+
+# ---- replay records survive restart (Codex review on PR #3) ----------------------
+@pytest.mark.risk("R02", "R13")
+@pytest.mark.parametrize(("elapsed", "revoked"), [(AUTH_CODE_TTL - 1, True),
+                                                  (AUTH_CODE_TTL, False)])
+async def test_code_replay_after_restart_still_revokes(provider, settings, clock,
+                                                       elapsed, revoked):
+    """Was: redeemed-code records lived only in memory, so a replay after a restart
+    within the code's lifetime was rejected without revoking its tokens."""
+    c = client()
+    await provider.register_client(c)
+    code = o.AuthorizationCode(
+        code="replayed", scopes=[SCOPE_READ], expires_at=clock() + AUTH_CODE_TTL,
+        client_id="c1", code_challenge="x" * 43, redirect_uri=AnyUrl(REDIRECT),
+        redirect_uri_provided_explicitly=True,
+    )
+    provider._codes["replayed"] = code
+    tok = await provider.exchange_authorization_code(c, code)
+    assert token_hash("replayed") in settings.oauth_state_file.read_text()
+    assert "replayed" not in settings.oauth_state_file.read_text().replace(
+        token_hash("replayed"), "")
+
+    clock.advance(elapsed)
+    restarted = OwnerOAuthProvider(settings, clock=clock)
+    assert await restarted.load_authorization_code(c, "replayed") is None
+    alive = await restarted.load_access_token(tok.access_token) is not None
+    if elapsed < AUTH_CODE_TTL:
+        assert alive is not revoked
+    assert (await restarted.load_refresh_token(c, tok.refresh_token) is None) is revoked
+
+
+@pytest.mark.risk("R13")
+@pytest.mark.parametrize("bad", [{"h": "not-a-dict"}, {"h": {"expires_at": "x"}}, {"h": None}])
+async def test_malformed_used_code_records_are_dropped(settings, clock, bad):
+    settings.oauth_state_file.parent.mkdir(parents=True, exist_ok=True)
+    settings.oauth_state_file.write_text(json.dumps({"used_codes": bad,
+                                                     "access": {"x": "garbage"}}))
+    p = OwnerOAuthProvider(settings, clock=clock)
+    assert p._used_codes == {}
+    assert p._access == {}

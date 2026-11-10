@@ -65,7 +65,7 @@ def test_sliding_window_counts_only_recent(limiter, clock):
 
 def test_success_resets_key(limiter):
     for _ in range(4):
-        limiter.record_failure("ip")
+        limiter.commit(limiter.record_failure("ip"))      # completed failures
     limiter.record_success("ip")
     for _ in range(4):
         limiter.record_failure("ip")
@@ -115,7 +115,7 @@ def test_memory_bound_on_keys(clock, keys, expected_size):
 
 # ---- reservations: attempts are counted before they are evaluated ----------------
 def test_success_releases_only_its_own_reservation(limiter, clock):
-    limiter.record_failure("ip")             # a real failure, stays in the global count
+    limiter.commit(limiter.record_failure("ip"))   # a real failure, stays in the global count
     clock.t += 1
     r = limiter.record_failure("ip")
     limiter.record_success("ip", r)
@@ -135,3 +135,54 @@ def test_success_without_reservation_keeps_global_count(limiter):
     limiter.record_failure("ip")
     limiter.record_success("ip")
     assert len(limiter._global) == 1
+
+
+# ---- in-flight attempts survive a concurrent success (Codex review on PR #3) -------
+def test_success_keeps_other_in_flight_attempts_counted(limiter):
+    """Was: a correct login wiped the whole per-key list, including wrong guesses that
+    were reserved but still being checked, so a new batch could start at once."""
+    queued = [limiter.record_failure("ip") for _ in range(4)]   # still being checked
+    mine = limiter.record_failure("ip")
+    limiter.record_success("ip", mine)
+    assert len(limiter._hits["ip"]) == 4
+    limiter.record_failure("ip")
+    assert limiter.is_locked("ip")                              # 4 queued + 1 new = 5
+    for r in queued:
+        limiter.commit(r)
+    assert limiter.is_locked("ip")
+
+
+def test_success_resets_completed_but_not_pending(limiter):
+    for _ in range(3):
+        limiter.commit(limiter.record_failure("ip"))           # completed
+    pending = limiter.record_failure("ip")                     # in flight
+    limiter.record_success("ip", limiter.record_failure("ip"))
+    assert len(limiter._hits["ip"]) == 1
+    limiter.commit(pending)
+    limiter.record_success("ip")
+    assert "ip" not in limiter._hits
+
+
+def test_reservations_are_unique_even_at_the_same_instant(limiter):
+    a, b = limiter.record_failure("ip"), limiter.record_failure("ip")
+    assert a != b                                              # fake clock never moves
+    limiter.record_success("ip", a)
+    assert len(limiter._global) == 1
+
+
+def test_inflight_records_age_out(limiter, clock):
+    limiter.record_failure("ip")                               # never settled
+    clock.t += 3601
+    limiter.is_locked("ip")
+    assert limiter._inflight == {}
+
+
+def test_commit_of_unknown_reservation_is_harmless(limiter):
+    limiter.commit(12345)
+    assert limiter._inflight == {}
+
+
+def test_success_by_other_key_does_not_touch_pending_attempts(limiter):
+    limiter.record_failure("attacker")
+    limiter.record_success("owner", limiter.record_failure("owner"))
+    assert len(limiter._hits["attacker"]) == 1

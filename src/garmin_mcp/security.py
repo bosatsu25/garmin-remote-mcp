@@ -23,7 +23,11 @@ SCRYPT_R = 8
 SCRYPT_P = 1
 SCRYPT_DKLEN = 32
 SCRYPT_MAXMEM = 256 * 1024 * 1024
-_HASH_PREFIX = "scrypt"
+# "scrypt-nfkc": passphrase NFKC-normalized before hashing (current).
+# "scrypt": legacy, raw passphrase bytes (hashes made before normalization existed);
+#           still accepted so an upgrade never locks the owner out.
+_HASH_PREFIX = "scrypt-nfkc"
+_LEGACY_PREFIX = "scrypt"
 
 
 class SecretFormatError(ValueError):
@@ -49,7 +53,7 @@ def _scrypt(password: str, salt: bytes, n: int, r: int, p: int) -> bytes:
 
 def hash_owner_password(password: str, *, n: int = SCRYPT_N, r: int = SCRYPT_R,
                         p: int = SCRYPT_P) -> str:
-    """Return ``scrypt$N$r$p$salt$hash`` (base64url, unpadded)."""
+    """Return ``scrypt-nfkc$N$r$p$salt$hash`` (base64url, unpadded)."""
     if has_control_chars(password):
         raise ValueError("password must not contain control characters")
     salt = secrets.token_bytes(16)
@@ -74,12 +78,15 @@ class OwnerSecret:
     p: int
     salt: bytes = field(repr=False)
     digest: bytes = field(repr=False)
+    normalize: bool = True
 
     @classmethod
     def from_hash(cls, encoded: str) -> OwnerSecret:
         parts = encoded.strip().split("$")
-        if len(parts) != 6 or parts[0] != _HASH_PREFIX:
-            raise SecretFormatError("OWNER_PASSWORD_HASH must look like scrypt$N$r$p$salt$hash")
+        if len(parts) != 6 or parts[0] not in (_HASH_PREFIX, _LEGACY_PREFIX):
+            raise SecretFormatError(
+                "OWNER_PASSWORD_HASH must look like scrypt-nfkc$N$r$p$salt$hash"
+            )
         try:
             n, r, p = int(parts[1]), int(parts[2]), int(parts[3])
             salt, digest = _b64d(parts[4]), _b64d(parts[5])
@@ -89,7 +96,8 @@ class OwnerSecret:
             raise SecretFormatError("OWNER_PASSWORD_HASH uses scrypt parameters that are too weak")
         if len(salt) < 16 or len(digest) != SCRYPT_DKLEN:
             raise SecretFormatError("OWNER_PASSWORD_HASH salt/hash length is invalid")
-        return cls(n=n, r=r, p=p, salt=salt, digest=digest)
+        return cls(n=n, r=r, p=p, salt=salt, digest=digest,
+                   normalize=parts[0] == _HASH_PREFIX)
 
     @classmethod
     def from_plaintext(cls, password: str, *, n: int = SCRYPT_N) -> OwnerSecret:
@@ -102,7 +110,8 @@ class OwnerSecret:
         # scrypt's inner HMAC zero-pads keys, so "pw" and "pw\0" would collide.
         if has_control_chars(candidate):
             return False
-        actual = _scrypt(normalize_password(candidate), self.salt, self.n, self.r, self.p)
+        material = normalize_password(candidate) if self.normalize else candidate
+        actual = _scrypt(material, self.salt, self.n, self.r, self.p)
         return hmac.compare_digest(actual, self.digest)
 
 
@@ -159,9 +168,16 @@ class FailureRateLimiter:
     clock: Callable[[], float] = time.time
     _hits: dict[str, list[float]] = field(default_factory=dict)
     _global: list[float] = field(default_factory=list)
+    # reservation id -> (key, timestamp) for attempts counted but not yet decided
+    _inflight: dict[int, tuple[str, float]] = field(default_factory=dict)
+    _next_id: int = 0
 
     def _prune(self, now: float) -> None:
         self._global = [t for t in self._global if t > now - self.global_window]
+        self._inflight = {
+            rid: (k, t) for rid, (k, t) in self._inflight.items()
+            if t > now - max(self.per_key_window, self.global_window)
+        }
         for k in list(self._hits):
             kept = [t for t in self._hits[k] if t > now - self.per_key_window]
             if kept:
@@ -177,12 +193,13 @@ class FailureRateLimiter:
             or len(self._global) >= self.global_max
         )
 
-    def record_failure(self, key: str) -> float:
-        """Count one attempt against ``key``; returns its timestamp (the reservation).
+    def record_failure(self, key: str) -> int:
+        """Count one attempt against ``key`` and return its reservation id.
 
-        Callers must count an attempt *before* the slow password check and hand the
-        reservation to ``record_success`` if it turns out to be legitimate. Counting only
-        afterwards lets N concurrent requests all pass ``is_locked`` and get N guesses.
+        Callers count an attempt *before* the slow password check (counting afterwards
+        lets N concurrent requests all pass ``is_locked`` and get N guesses), then settle
+        the reservation: ``commit`` it on a wrong password, or pass it to
+        ``record_success`` on a right one.
         """
         now = self.clock()
         self._prune(now)
@@ -192,13 +209,30 @@ class FailureRateLimiter:
             del self._hits[oldest]
         self._hits.setdefault(key, []).append(now)
         self._global.append(now)
-        return now
+        self._next_id += 1
+        self._inflight[self._next_id] = (key, now)
+        return self._next_id
 
-    def record_success(self, key: str, reservation: float | None = None) -> None:
-        self._hits.pop(key, None)
-        if reservation is not None:
+    def commit(self, reservation: int) -> None:
+        """The attempt failed: it stays counted, it is just no longer in flight."""
+        self._inflight.pop(reservation, None)
+
+    def record_success(self, key: str, reservation: int | None = None) -> None:
+        """Release this attempt and reset the key's *completed* failures.
+
+        Other attempts from the same key that are still being checked stay counted:
+        resetting them too would let a burst queued behind a correct login evade the
+        per-key limit.
+        """
+        mine = self._inflight.pop(reservation, None) if reservation is not None else None
+        if mine is not None:
             with contextlib.suppress(ValueError):
-                self._global.remove(reservation)
+                self._global.remove(mine[1])
+        pending = [t for k, t in self._inflight.values() if k == key]
+        if pending:
+            self._hits[key] = pending
+        else:
+            self._hits.pop(key, None)
 
 
 # ------------------------------------------------------------------- redaction

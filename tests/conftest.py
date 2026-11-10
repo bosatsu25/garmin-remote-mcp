@@ -45,6 +45,8 @@ _SECRET = OwnerSecret.from_plaintext(PASSWORD, n=2**14)
 
 # ------------------------------------------------------------- traceability
 _RISK_KEY = pytest.StashKey[dict[str, list[str]]]()
+_TESTS_KEY = pytest.StashKey[set[str]]()
+_META_MODULES = ("test_traceability", "test_asvs_checklist")
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -69,7 +71,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     problems: list[str] = []
     for item in items:
         ids = [i for m in item.iter_markers("risk") for i in m.args]
-        if item.module and item.module.__name__.endswith("test_traceability"):
+        if item.module and item.module.__name__.endswith(_META_MODULES):
             continue
         if not ids:
             problems.append(f"{item.nodeid}: missing @pytest.mark.risk")
@@ -78,8 +80,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 problems.append(f"{item.nodeid}: unknown risk id {rid}")
             covered.setdefault(rid, []).append(item.nodeid)
     config.stash[_RISK_KEY] = covered
+    # "tests/unit/test_x.py::test_name" without parametrization ids
+    config.stash[_TESTS_KEY] = {i.nodeid.split("[")[0] for i in items}
     if problems:
         raise pytest.UsageError("Traceability violations:\n" + "\n".join(problems))
+
+
+@pytest.fixture
+def collected_tests(request: pytest.FixtureRequest) -> set[str]:
+    return request.config.stash[_TESTS_KEY]
 
 
 @pytest.fixture

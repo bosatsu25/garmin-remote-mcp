@@ -25,6 +25,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -68,6 +69,11 @@ MAX_REDIRECT_URIS = 5
 MAX_CLIENT_NAME = 100
 MAX_PASSWORD_FIELD = 1024
 REQUEST_ID_BYTES = 32
+MAX_STATE_LENGTH = 512
+ALLOWED_GRANT_TYPES = frozenset({"authorization_code", "refresh_token"})
+ADMIN_SESSION_TTL = 300
+MAX_ADMIN_SESSIONS = 5
+CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}", re.ASCII)
 
 
 def token_hash(token: str) -> str:
@@ -98,6 +104,10 @@ class OwnerOAuthProvider:
         self._retired: dict[str, dict[str, Any]] = {}
         self._codes: dict[str, AuthorizationCode] = {}
         self._pending: dict[str, Pending] = {}
+        # Redeemed codes -> the token family they produced, kept until the code would
+        # have expired, so a replayed code can revoke what it issued (ASVS V10.4.2).
+        self._used_codes: dict[str, dict[str, Any]] = {}
+        self._admin_sessions: dict[str, float] = {}
         self.limiter = FailureRateLimiter(clock=clock)
         self._load()
 
@@ -118,6 +128,7 @@ class OwnerOAuthProvider:
         self._access = dict(data.get("access", {}))
         self._refresh = dict(data.get("refresh", {}))
         self._retired = dict(data.get("retired", {}))
+        self._used_codes = dict(data.get("used_codes", {}))
         self._purge_expired()
 
     def _save(self) -> None:
@@ -129,6 +140,9 @@ class OwnerOAuthProvider:
                 "access": self._access,
                 "refresh": self._refresh,
                 "retired": self._retired,
+                # Keyed by code hash; lets replay revocation survive a restart within
+                # the code's lifetime (ASVS V10.4.2).
+                "used_codes": self._used_codes,
             }
         )
         tmp = self._state_file.with_name(f".{self._state_file.name}.{secrets.token_hex(6)}.tmp")
@@ -147,7 +161,9 @@ class OwnerOAuthProvider:
     def _purge_expired(self) -> None:
         now = self.clock()
 
-        def live(rec: dict[str, Any]) -> bool:
+        def live(rec: Any) -> bool:
+            if not isinstance(rec, dict):
+                return False
             exp = rec.get("expires_at")
             return isinstance(exp, (int, float)) and exp > now
 
@@ -155,6 +171,8 @@ class OwnerOAuthProvider:
         self._refresh = {k: v for k, v in self._refresh.items() if live(v)}
         self._retired = {k: v for k, v in self._retired.items() if live(v)}
         self._codes = {k: v for k, v in self._codes.items() if v.expires_at > now}
+        self._used_codes = {k: v for k, v in self._used_codes.items() if live(v)}
+        self._admin_sessions = {k: v for k, v in self._admin_sessions.items() if v > now}
         self._pending = {k: v for k, v in self._pending.items() if v.expires_at > now}
 
     # ------------------------------------------------------------------ clients
@@ -178,6 +196,12 @@ class OwnerOAuthProvider:
         if client_info.client_name and len(client_info.client_name) > MAX_CLIENT_NAME:
             raise RegistrationError(
                 error="invalid_client_metadata", error_description="client_name too long"
+            )
+        grants = set(client_info.grant_types or [])
+        if "authorization_code" not in grants or not grants <= ALLOWED_GRANT_TYPES:
+            raise RegistrationError(
+                error="invalid_client_metadata",
+                error_description="only authorization_code and refresh_token grants are offered",
             )
         if client_info.scope:
             requested = client_info.scope.split()
@@ -209,6 +233,12 @@ class OwnerOAuthProvider:
             raise AuthorizeError(error="invalid_target", error_description="unknown resource")
         if params.scopes and any(s not in ALL_SCOPES for s in params.scopes):
             raise AuthorizeError(error="invalid_scope", error_description="unknown scope")
+        # RFC 7636 §4.2: 43-128 unreserved chars. Also bounds what we keep per request.
+        if not CODE_CHALLENGE_RE.fullmatch(params.code_challenge or ""):
+            raise AuthorizeError(error="invalid_request",
+                                 error_description="malformed code_challenge")
+        if params.state is not None and len(params.state) > MAX_STATE_LENGTH:
+            raise AuthorizeError(error="invalid_request", error_description="state too long")
         now = self.clock()
         self._purge_expired()
         if len(self._pending) >= MAX_PENDING:
@@ -267,8 +297,11 @@ class OwnerOAuthProvider:
         if not pending:
             return _page(_EXPIRED, status=400)
 
+        # Count the attempt *before* the slow check (no await between the lock test above
+        # and this line), so concurrent submissions cannot exceed the limit.
+        reservation = self.limiter.record_failure(ip)
         if not await self.verify_owner(password):
-            self.limiter.record_failure(ip)
+            self.limiter.commit(reservation)
             audit.warning("login_failed ip=%s client_id=%s", ip, pending.client_id)
             return self._login_form(request_id, pending, error="パスワードが違います。",
                                     status=401)
@@ -278,7 +311,7 @@ class OwnerOAuthProvider:
             return _page(_EXPIRED, status=400)
         if pending.client_id not in self._clients:
             return _page(_EXPIRED, status=400)
-        self.limiter.record_success(ip)
+        self.limiter.record_success(ip, reservation)
 
         scopes = [SCOPE_READ]
         if want_write and self.settings.allow_write:
@@ -307,34 +340,122 @@ class OwnerOAuthProvider:
     def _login_form(self, request_id: str, pending: Pending, error: str | None = None,
                     status: int = 200) -> HTMLResponse:
         return _login_form(request_id, pending, allow_write=self.settings.allow_write,
+                           max_days=self.settings.token_family_max_age // 86400,
                            error=error, status=status)
+
+    # ------------------------------------------------- owner: review / revoke
+    def connections(self) -> list[dict[str, Any]]:
+        """One entry per live grant (token family), newest first."""
+        self._purge_expired()
+        out = []
+        for rec in self._refresh.values():
+            client = self._clients.get(rec["client_id"], {})
+            out.append({
+                "family": rec["family"],
+                "client_name": client.get("client_name") or rec["client_id"],
+                "scopes": list(rec["scopes"]),
+                "created_at": rec["family_created_at"],
+                "expires_at": rec["family_created_at"] + self.settings.token_family_max_age,
+            })
+        return sorted(out, key=lambda c: c["created_at"], reverse=True)
+
+    def _new_admin_session(self) -> str:
+        self._purge_expired()
+        while len(self._admin_sessions) >= MAX_ADMIN_SESSIONS:
+            del self._admin_sessions[min(self._admin_sessions, key=self._admin_sessions.get)]
+        token = secrets.token_urlsafe(32)
+        self._admin_sessions[token_hash(token)] = self.clock() + ADMIN_SESSION_TTL
+        return token
+
+    def _admin_session_valid(self, token: str) -> bool:
+        exp = self._admin_sessions.get(token_hash(token)) if token else None
+        return exp is not None and exp > self.clock()
+
+    async def connections_page(self, request: Request) -> Response:
+        """GET: passphrase form. POST: verify the owner, then list live connections.
+
+        No cookies: the short-lived session token lives only in the rendered page's hidden
+        fields, so a cross-site request can never carry it (no CSRF surface).
+        """
+        if request.method == "GET":
+            return _connections_login()
+        form = await request.form()
+        ip = self.client_ip(request)
+        if self.limiter.is_locked(ip):
+            audit.warning("login_rate_limited ip=%s", ip)
+            return _page("試行回数が多すぎます。しばらく待ってから再試行してください。", status=429,
+                         extra_headers={"Retry-After": "900"})
+        reservation = self.limiter.record_failure(ip)
+        if not await self.verify_owner(str(form.get("password", ""))):
+            self.limiter.commit(reservation)
+            audit.warning("admin_login_failed ip=%s", ip)
+            return _connections_login(error="パスワードが違います。", status=401)
+        self.limiter.record_success(ip, reservation)
+        audit.info("connections_viewed ip=%s", ip)
+        return _connections_list(self.connections(), self._new_admin_session())
+
+    async def connections_revoke(self, request: Request) -> Response:
+        form = await request.form()
+        session = str(form.get("session", ""))[:128]
+        if not self._admin_session_valid(session):
+            return _connections_login(error="セッションの有効期限が切れました。", status=401)
+        target = str(form.get("family", ""))[:64]
+        live = {c["family"] for c in self.connections()}
+        victims = live if target == "*" else live & {target}
+        async with self._lock:
+            n = sum(self._revoke_family(f) for f in victims)
+            self._save()
+        audit.warning("connections_revoked families=%d tokens=%d ip=%s", len(victims), n,
+                      self.client_ip(request))
+        return _connections_list(self.connections(), session,
+                                 notice=f"{len(victims)} 件の接続を取り消しました。")
 
     # -------------------------------------------------------------------- codes
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
         code = self._codes.get(authorization_code)
-        if not code or code.client_id != client.client_id or code.expires_at <= self.clock():
+        if code is None:
+            await self._revoke_if_code_reused(authorization_code)
+            return None
+        if code.client_id != client.client_id or code.expires_at <= self.clock():
             return None
         return code
+
+    async def _revoke_if_code_reused(self, code: str) -> None:
+        """A code that was already redeemed came back: it leaked. Revoke what it issued."""
+        used = self._used_codes.get(token_hash(code))
+        if used is None or used["expires_at"] <= self.clock():
+            return
+        async with self._lock:
+            n = self._revoke_family(used["family"])
+            self._save()
+        audit.warning("authorization_code_reuse_detected client_id=%s tokens_revoked=%d",
+                      used["client_id"], n)
 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
         if self._codes.pop(authorization_code.code, None) is None:
+            await self._revoke_if_code_reused(authorization_code.code)
             raise TokenError(error="invalid_grant", error_description="code already used")
+        # Recorded synchronously with the pop above, so a concurrent second redemption
+        # always finds it.
+        family = {"id": secrets.token_hex(16), "created_at": self.clock()}
+        self._used_codes[token_hash(authorization_code.code)] = {
+            "family": family["id"],
+            "client_id": client.client_id,
+            "expires_at": authorization_code.expires_at,
+        }
         async with self._lock:
-            token = self._issue(client.client_id, authorization_code.scopes, family=None)
+            token = self._issue(client.client_id, authorization_code.scopes, family=family)
             self._save()
         audit.info("token_issued client_id=%s grant=authorization_code", client.client_id)
         return token
 
     # ------------------------------------------------------------------- tokens
-    def _issue(self, client_id: str, scopes: list[str], family: dict[str, Any] | None
-               ) -> OAuthToken:
+    def _issue(self, client_id: str, scopes: list[str], family: dict[str, Any]) -> OAuthToken:
         now = self.clock()
-        if family is None:
-            family = {"id": secrets.token_hex(16), "created_at": now}
         family_deadline = family["created_at"] + self.settings.token_family_max_age
         access = secrets.token_urlsafe(32)
         refresh = secrets.token_urlsafe(48)
@@ -347,6 +468,7 @@ class OwnerOAuthProvider:
             "expires_at": access_exp,
             "refresh": r_hash,
             "family": family["id"],
+            "resource": self.settings.resource_url,
         }
         self._refresh[r_hash] = {
             "client_id": client_id,
@@ -355,6 +477,7 @@ class OwnerOAuthProvider:
             "access": a_hash,
             "family": family["id"],
             "family_created_at": family["created_at"],
+            "resource": self.settings.resource_url,
         }
         return OAuthToken(
             access_token=access,
@@ -394,7 +517,7 @@ class OwnerOAuthProvider:
             client_id=rec["client_id"],
             scopes=rec["scopes"],
             expires_at=int(rec["expires_at"]),
-            resource=self.settings.resource_url,
+            resource=rec.get("resource"),
             subject=OWNER_SUBJECT,
         )
 
@@ -438,7 +561,9 @@ class OwnerOAuthProvider:
             client_id=rec["client_id"],
             scopes=rec["scopes"],
             expires_at=int(rec["expires_at"]),
-            resource=self.settings.resource_url,
+            # The audience the token was issued for, as stored: the bearer middleware
+            # refuses anything that is not this server (ASVS V10.3.1).
+            resource=rec.get("resource"),
             subject=OWNER_SUBJECT,
         )
 
@@ -471,6 +596,8 @@ h1{font-size:1.2rem;margin:0 0 12px}p{line-height:1.6;font-size:.95rem}
 code{background:#f5f5f4;padding:2px 6px;border-radius:4px;word-break:break-all}
 input[type=password]{width:100%;box-sizing:border-box;padding:10px;font-size:1rem;
 border:1px solid #d6d3d1;border-radius:8px;margin:8px 0 16px}
+ul{list-style:none;padding:0}li{padding:12px 0;border-top:1px solid #d6d3d1;font-size:.9rem}
+li form{margin-top:8px}
 label.cb{display:flex;gap:8px;align-items:flex-start;margin:0 0 16px;font-size:.9rem}
 button{width:100%;padding:10px;font-size:1rem;border:0;border-radius:8px;background:#1c1917;
 color:#fff;cursor:pointer}.err{color:#b91c1c}
@@ -516,7 +643,7 @@ def _origin(uri: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
-def _login_form(request_id: str, pending: Pending, *, allow_write: bool,
+def _login_form(request_id: str, pending: Pending, *, allow_write: bool, max_days: int,
                 error: str | None = None, status: int = 200) -> HTMLResponse:
     redirect = str(pending.params.redirect_uri)
     client = html.escape(pending.client_name or pending.client_id)
@@ -529,7 +656,10 @@ def _login_form(request_id: str, pending: Pending, *, allow_write: bool,
     body = f"""<h1>Garmin MCP への接続を許可</h1>
 <p><b>{client}</b> があなたの Garmin Connect データの<b>読み取り</b>を求めています。</p>
 <p>許可後の戻り先: <code>{html.escape(_origin(redirect))}</code></p>
-<p>自分で開始した接続でなければ、このページを閉じてください。</p>
+<p>この名前はクライアントの自己申告で、検証されていません。自分で開始した接続でなければ、
+このページを閉じてください。</p>
+<p>許可は最長 {max_days} 日間有効です。接続の確認と取り消しは
+<code>/oauth/connections</code> で行えます。</p>
 {err}
 <form method=post action="/oauth/login">
 <input type=hidden name=request value="{html.escape(request_id)}">
@@ -540,3 +670,42 @@ def _login_form(request_id: str, pending: Pending, *, allow_write: bool,
 <button type=submit>許可する</button>
 </form>"""
     return HTMLResponse(_shell(body), status_code=status, headers=_headers(_origin(redirect)))
+
+
+def _connections_login(error: str | None = None, status: int = 200) -> HTMLResponse:
+    err = f"<p class=err role=alert>{html.escape(error)}</p>" if error else ""
+    body = f"""<h1>接続の管理</h1>
+<p>このサーバーへのアクセスを許可している接続を確認し、取り消せます。</p>
+{err}
+<form method=post action="/oauth/connections">
+<label for=pw>オーナーパスワード</label>
+<input id=pw type=password name=password autocomplete=current-password required autofocus
+ maxlength={MAX_PASSWORD_FIELD}>
+<button type=submit>表示する</button>
+</form>"""
+    return HTMLResponse(_shell(body), status_code=status, headers=_headers())
+
+
+def _fmt_day(ts: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
+def _connections_list(conns: list[dict[str, Any]], session: str,
+                      notice: str | None = None) -> HTMLResponse:
+    sess = html.escape(session)
+    note = f"<p role=status>{html.escape(notice)}</p>" if notice else ""
+    rows = []
+    for c in conns:
+        access = "読み取り＋書き込み" if SCOPE_WRITE in c["scopes"] else "読み取りのみ"
+        rows.append(f"""<li><b>{html.escape(str(c["client_name"]))}</b><br>
+{access}・接続日 {_fmt_day(c["created_at"])}・期限 {_fmt_day(c["expires_at"])}（UTC）
+<form method=post action="/oauth/connections/revoke">
+<input type=hidden name=session value="{sess}">
+<input type=hidden name=family value="{html.escape(str(c["family"]))}">
+<button type=submit>この接続を取り消す</button></form></li>""")
+    listing = f"<ul>{''.join(rows)}</ul>" if rows else "<p>有効な接続はありません。</p>"
+    revoke_all = f"""<form method=post action="/oauth/connections/revoke">
+<input type=hidden name=session value="{sess}"><input type=hidden name=family value="*">
+<button type=submit>すべての接続を取り消す</button></form>""" if rows else ""
+    body = f"<h1>接続の管理</h1>{note}{listing}{revoke_all}"
+    return HTMLResponse(_shell(body), headers=_headers())

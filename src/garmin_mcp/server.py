@@ -31,6 +31,7 @@ from .security import redact
 from .workouts import Step, build_workout
 
 logger = logging.getLogger(__name__)
+audit = logging.getLogger("garmin_mcp.audit")
 
 T = TypeVar("T")
 
@@ -108,6 +109,7 @@ def require_write_scope() -> None:
     """Write tools need the garmin:write scope granted on the consent page."""
     token = get_access_token()
     if token is None or SCOPE_WRITE not in token.scopes:
+        audit.warning("write_denied client_id=%s", token.client_id if token else None)
         raise ToolError(
             "This connection was authorized read-only. Reconnect the connector and tick "
             "the write permission on the consent page to allow this."
@@ -153,6 +155,14 @@ def create_server(
     @mcp.custom_route("/oauth/login", methods=["GET", "POST"], include_in_schema=False)
     async def oauth_login(request: Request) -> Response:
         return await provider.login_page(request)
+
+    @mcp.custom_route("/oauth/connections", methods=["GET", "POST"], include_in_schema=False)
+    async def oauth_connections(request: Request) -> Response:
+        return await provider.connections_page(request)
+
+    @mcp.custom_route("/oauth/connections/revoke", methods=["POST"], include_in_schema=False)
+    async def oauth_connections_revoke(request: Request) -> Response:
+        return await provider.connections_revoke(request)
 
     @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
     async def healthz(request: Request) -> Response:
@@ -513,6 +523,9 @@ def create_app(
             allowed_origins=[settings.public_url, "https://claude.ai", "https://claude.com"],
         ),
     )
+    # Starlette would answer /mcp/ with a redirect built from the (attacker-controlled)
+    # Host header. Unknown paths are simply 404.
+    starlette_app.router.redirect_slashes = False
     # Body limit applies to every route (DCR, token, consent form), not just /mcp.
     app: ASGIApp = RequestBodyLimitMiddleware(starlette_app, MAX_BODY_BYTES)
     app = SecurityHeadersMiddleware(app, hsts=public.scheme == "https")

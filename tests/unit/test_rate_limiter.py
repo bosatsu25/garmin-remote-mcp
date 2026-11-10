@@ -111,3 +111,27 @@ def test_memory_bound_on_keys(clock, keys, expected_size):
     assert len(lim._hits) == expected_size
     if keys > 3:
         assert "ip0" not in lim._hits   # oldest evicted
+
+
+# ---- reservations: attempts are counted before they are evaluated ----------------
+def test_success_releases_only_its_own_reservation(limiter, clock):
+    limiter.record_failure("ip")             # a real failure, stays in the global count
+    clock.t += 1
+    r = limiter.record_failure("ip")
+    limiter.record_success("ip", r)
+    assert limiter._global == [clock.t - 1]
+    assert "ip" not in limiter._hits
+
+
+def test_release_of_already_pruned_reservation_is_harmless(limiter, clock):
+    r = limiter.record_failure("ip")
+    clock.t += 4000                          # reservation aged out of the global window
+    limiter.is_locked("ip")
+    limiter.record_success("ip", r)
+    assert limiter._global == []
+
+
+def test_success_without_reservation_keeps_global_count(limiter):
+    limiter.record_failure("ip")
+    limiter.record_success("ip")
+    assert len(limiter._global) == 1

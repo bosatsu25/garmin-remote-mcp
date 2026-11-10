@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import hashlib
 import hmac
 import re
 import secrets
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -32,6 +34,12 @@ def has_control_chars(s: str) -> bool:
     return any(ord(c) < 0x20 or ord(c) == 0x7F for c in s)
 
 
+def normalize_password(s: str) -> str:
+    """NFKC, as NIST SP 800-63B recommends, so the same passphrase typed on different
+    keyboards/IMEs (composed vs decomposed kana, full-width vs half-width) verifies."""
+    return unicodedata.normalize("NFKC", s)
+
+
 def _scrypt(password: str, salt: bytes, n: int, r: int, p: int) -> bytes:
     return hashlib.scrypt(
         password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=SCRYPT_DKLEN,
@@ -45,7 +53,7 @@ def hash_owner_password(password: str, *, n: int = SCRYPT_N, r: int = SCRYPT_R,
     if has_control_chars(password):
         raise ValueError("password must not contain control characters")
     salt = secrets.token_bytes(16)
-    digest = _scrypt(password, salt, n, r, p)
+    digest = _scrypt(normalize_password(password), salt, n, r, p)
     return f"{_HASH_PREFIX}${n}${r}${p}${_b64e(salt)}${_b64e(digest)}"
 
 
@@ -94,7 +102,7 @@ class OwnerSecret:
         # scrypt's inner HMAC zero-pads keys, so "pw" and "pw\0" would collide.
         if has_control_chars(candidate):
             return False
-        actual = _scrypt(candidate, self.salt, self.n, self.r, self.p)
+        actual = _scrypt(normalize_password(candidate), self.salt, self.n, self.r, self.p)
         return hmac.compare_digest(actual, self.digest)
 
 
@@ -169,7 +177,13 @@ class FailureRateLimiter:
             or len(self._global) >= self.global_max
         )
 
-    def record_failure(self, key: str) -> None:
+    def record_failure(self, key: str) -> float:
+        """Count one attempt against ``key``; returns its timestamp (the reservation).
+
+        Callers must count an attempt *before* the slow password check and hand the
+        reservation to ``record_success`` if it turns out to be legitimate. Counting only
+        afterwards lets N concurrent requests all pass ``is_locked`` and get N guesses.
+        """
         now = self.clock()
         self._prune(now)
         if key not in self._hits and len(self._hits) >= self.max_keys:
@@ -178,9 +192,13 @@ class FailureRateLimiter:
             del self._hits[oldest]
         self._hits.setdefault(key, []).append(now)
         self._global.append(now)
+        return now
 
-    def record_success(self, key: str) -> None:
+    def record_success(self, key: str, reservation: float | None = None) -> None:
         self._hits.pop(key, None)
+        if reservation is not None:
+            with contextlib.suppress(ValueError):
+                self._global.remove(reservation)
 
 
 # ------------------------------------------------------------------- redaction

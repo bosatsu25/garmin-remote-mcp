@@ -101,3 +101,21 @@ def test_control_char_variants_never_verify(suffix):
 def test_hashing_rejects_control_chars():
     with pytest.raises(ValueError):
         hash_owner_password("a" * 20 + "\x00", n=N)
+
+
+# ---- NFKC normalization (NIST SP 800-63B): same passphrase, different keyboards ----
+@pytest.mark.parametrize(("stored", "typed"), [
+    ("がぎぐげご-passphrase-123", "がぎぐげご-passphrase-123"),  # NFC vs NFD
+    ("passphrase-ＡＢＣ-１２３-xyz", "passphrase-ABC-123-xyz"),                               # full-width
+    ("café-au-lait-passphrase", "café-au-lait-passphrase"),
+])
+def test_equivalent_unicode_forms_verify(stored, typed):
+    s = OwnerSecret.from_plaintext(stored, n=N)
+    assert s.verify(typed)
+    assert s.verify(stored)
+
+
+def test_normalization_does_not_merge_distinct_passwords():
+    s = OwnerSecret.from_plaintext("passphrase-abc-123-xyz", n=N)
+    assert not s.verify("passphrase-ABC-123-xyz")       # case still matters
+    assert not s.verify("passphrase-abc-123-xyz ")

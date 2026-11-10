@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# Tip: pin the base image by digest (python:3.13-slim@sha256:...) and let Dependabot bump it.
-FROM python:3.13-slim AS build
+# Base image is pinned by digest; Dependabot (docker ecosystem) proposes updates.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 # 1) Every third-party wheel is verified against requirements.lock hashes.
@@ -13,12 +13,14 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install --no-deps --no-build-isolation --prefix=/install .
 
-FROM python:3.13-slim
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 DATA_DIR=/data PORT=8000
 COPY --from=build /install /usr/local
-RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app \
- && mkdir -p /data && chown app:app /data && chmod 700 /data \
- && pip uninstall -y pip setuptools wheel 2>/dev/null || true
+# No package manager in the final image. (Separate RUN: a trailing `|| true` on the
+# user-creation chain would hide a failed useradd/chown.)
+RUN python -m pip uninstall -y pip
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app \
+ && mkdir -p /data && chown app:app /data && chmod 700 /data
 USER 10001:10001
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request,os;urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\",\"8000\")}/healthz',timeout=4)"
